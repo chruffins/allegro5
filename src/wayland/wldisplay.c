@@ -7,6 +7,7 @@
 #include "allegro5/internal/aintern_wldisplay.h"
 #include "allegro5/internal/aintern_wleglconfig.h"
 #include "allegro5/internal/aintern_wlfullscreen.h"
+#include "allegro5/internal/aintern_wlinput.h"
 #include "allegro5/internal/aintern_wlsystem.h"
 #include "allegro5/internal/aintern_display.h"
 #include "allegro5/platform/aintwl.h"
@@ -657,6 +658,28 @@ static bool wldpy_is_compatible_bitmap(ALLEGRO_DISPLAY *display,
     return true;
 }
 
+static bool wldpy_set_mouse_cursor(ALLEGRO_DISPLAY *display,
+    ALLEGRO_MOUSE_CURSOR *cursor)
+{
+    return _al_wl_set_mouse_cursor(display, cursor);
+}
+
+static bool wldpy_set_system_mouse_cursor(ALLEGRO_DISPLAY *display,
+    ALLEGRO_SYSTEM_MOUSE_CURSOR cursor_id)
+{
+    return _al_wl_set_system_mouse_cursor(display, cursor_id);
+}
+
+static bool wldpy_show_mouse_cursor(ALLEGRO_DISPLAY *display)
+{
+    return _al_wl_show_mouse_cursor(display);
+}
+
+static bool wldpy_hide_mouse_cursor(ALLEGRO_DISPLAY *display)
+{
+    return _al_wl_hide_mouse_cursor(display);
+}
+
 static void wldpy_set_window_title(ALLEGRO_DISPLAY *display, const char *title)
 {
     ALLEGRO_SYSTEM_WAYLAND *system = (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
@@ -814,6 +837,10 @@ ALLEGRO_DISPLAY_INTERFACE *_al_display_wayland_driver(void)
     wldpy_vt.update_render_state = _al_ogl_update_render_state;
 
     wldpy_vt.set_window_title = wldpy_set_window_title;
+    wldpy_vt.set_mouse_cursor = wldpy_set_mouse_cursor;
+    wldpy_vt.set_system_mouse_cursor = wldpy_set_system_mouse_cursor;
+    wldpy_vt.show_mouse_cursor = wldpy_show_mouse_cursor;
+    wldpy_vt.hide_mouse_cursor = wldpy_hide_mouse_cursor;
     wldpy_vt.set_display_flag = wldpy_set_display_flag;
     wldpy_vt.get_window_constraints = wldpy_get_window_constraints;
     wldpy_vt.set_window_constraints = wldpy_set_window_constraints;

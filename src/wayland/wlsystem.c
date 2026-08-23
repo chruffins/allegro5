@@ -29,6 +29,13 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping,
 };
 
+/* wl_registry_bind must never request a version newer than the one the
+ * compositor advertised for this global. */
+static uint32_t wl_clamp_version(uint32_t advertised, uint32_t requested)
+{
+    return advertised < requested ? advertised : requested;
+}
+
 static void registry_handle_global(void *data,
                 struct wl_registry *registry,
                 uint32_t name,
@@ -36,14 +43,13 @@ static void registry_handle_global(void *data,
                 uint32_t version)
 {
     ALLEGRO_SYSTEM_WAYLAND *s = data;
-    (void)version;
 
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         s->compositor = wl_registry_bind(
             registry,
             name,
             &wl_compositor_interface,
-            4);
+            wl_clamp_version(version, 4));
         if (s->compositor) {
             ALLEGRO_INFO("Wayland compositor created\n");
         }
@@ -54,7 +60,7 @@ static void registry_handle_global(void *data,
             registry,
             name,
             &wl_shm_interface,
-            1);
+            wl_clamp_version(version, 1));
         if (s->shm) {
             ALLEGRO_INFO("Wayland shared memory created\n");
         }
@@ -62,21 +68,24 @@ static void registry_handle_global(void *data,
 
     if (strcmp(interface, wl_output_interface.name) == 0) {
         struct wl_output *output = wl_registry_bind(
-            registry, name, &wl_output_interface, 4);
+            registry, name, &wl_output_interface,
+            wl_clamp_version(version, 4));
         if (output)
             _al_wayland_add_output(s, output, name);
     }
 
     if (strcmp(interface, wl_seat_interface.name) == 0) {
         struct wl_seat *seat = wl_registry_bind(
-            registry, name, &wl_seat_interface, 8);
+            registry, name, &wl_seat_interface,
+            wl_clamp_version(version, 8));
         if (seat)
             _al_wl_seat_add(s, seat);
     }
 
     if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         s->cursor_shape_manager = wl_registry_bind(
-            registry, name, &wp_cursor_shape_manager_v1_interface, 2);
+            registry, name, &wp_cursor_shape_manager_v1_interface,
+            wl_clamp_version(version, 2));
         ALLEGRO_INFO("Wayland cursor shape manager created\n");
     }
 
@@ -84,7 +93,8 @@ static void registry_handle_global(void *data,
         /* Optional: used to emulate mouse warping via a locked pointer +
          * cursor position hint (al_set_mouse_xy). */
         s->pointer_constraints = wl_registry_bind(
-            registry, name, &zwp_pointer_constraints_v1_interface, 1);
+            registry, name, &zwp_pointer_constraints_v1_interface,
+            wl_clamp_version(version, 1));
         if (s->pointer_constraints) {
             ALLEGRO_INFO("Wayland pointer constraints created\n");
         }
@@ -95,7 +105,7 @@ static void registry_handle_global(void *data,
             registry,
             name,
             &xdg_wm_base_interface,
-            1);
+            wl_clamp_version(version, 1));
 
         xdg_wm_base_add_listener(
             s->wm_base,
@@ -111,7 +121,7 @@ static void registry_handle_global(void *data,
             registry,
             name,
             &zxdg_decoration_manager_v1_interface,
-            1);
+            wl_clamp_version(version, 1));
         if (s->decoration_manager) {
             ALLEGRO_INFO("Wayland decoration manager created\n");
         }
@@ -132,6 +142,47 @@ static const struct wl_registry_listener registry_listener = {
 	.global = registry_handle_global,
 	.global_remove = registry_handle_global_remove,
 };
+
+/* Cleanup for failures before the event thread and EGL/libdecor are started. */
+static void wl_cleanup_initialization(ALLEGRO_SYSTEM_WAYLAND *s,
+    struct wl_display *display, struct wl_registry *registry)
+{
+    _al_wl_input_shutdown(s);
+
+    if (s->seat) {
+        wl_seat_destroy(s->seat);
+        s->seat = NULL;
+    }
+
+    while (_al_vector_size(&s->outputs) > 0) {
+        struct ALLEGRO_WL_OUTPUT *o;
+        o = *((struct ALLEGRO_WL_OUTPUT **)_al_vector_ref(&s->outputs, 0));
+        wl_output_destroy(o->output);
+        al_free(o);
+        _al_vector_delete_at(&s->outputs, 0);
+    }
+    _al_vector_free(&s->outputs);
+
+    if (s->shm)
+        wl_shm_destroy(s->shm);
+    if (s->compositor)
+        wl_compositor_destroy(s->compositor);
+    if (s->wm_base)
+        xdg_wm_base_destroy(s->wm_base);
+    if (s->decoration_manager)
+        zxdg_decoration_manager_v1_destroy(s->decoration_manager);
+    if (s->cursor_shape_manager)
+        wp_cursor_shape_manager_v1_destroy(s->cursor_shape_manager);
+    if (s->pointer_constraints)
+        zwp_pointer_constraints_v1_destroy(s->pointer_constraints);
+    if (registry)
+        wl_registry_destroy(registry);
+    if (s->xkb_context)
+        xkb_context_unref(s->xkb_context);
+
+    wl_display_disconnect(display);
+    al_free(s);
+}
 
 static ALLEGRO_SYSTEM *wl_initialize(int flags) {
     struct wl_display *display;
@@ -165,7 +216,11 @@ static ALLEGRO_SYSTEM *wl_initialize(int flags) {
 
     registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, s);
-	wl_display_roundtrip(display);
+    if (wl_display_roundtrip(display) < 0) {
+        ALLEGRO_ERROR("Initial Wayland registry roundtrip failed.\n");
+        wl_cleanup_initialization(s, display, registry);
+        return NULL;
+    }
     /* The roundtrip implicitly creates the compositor, the
      * shared memory (used for software rendering), and the
      * XDG window management base.
@@ -174,7 +229,19 @@ static ALLEGRO_SYSTEM *wl_initialize(int flags) {
     /* A second roundtrip delivers the async events that arrive after
      * binding: wl_output geometry/mode, and the wl_seat capabilities
      * (which bind the keyboard and pointer objects). */
-    wl_display_roundtrip(display);
+    if (wl_display_roundtrip(display) < 0) {
+        ALLEGRO_ERROR("Wayland capability roundtrip failed.\n");
+        wl_cleanup_initialization(s, display, registry);
+        return NULL;
+    }
+
+    /* Crash here because stuff is broken. */
+    if (!s->compositor || !s->wm_base) {
+        ALLEGRO_ERROR("Wayland compositor is missing wl_compositor or "
+            "xdg_wm_base.\n");
+        wl_cleanup_initialization(s, display, registry);
+        return NULL;
+    }
 
     /* EGL initialization.  The Wayland display is the native display
      * handle, and eglGetPlatformDisplay() (core in EGL 1.5) implicitly
@@ -338,6 +405,22 @@ static bool wl_get_monitor_info(int adapter, ALLEGRO_MONITOR_INFO *info)
 }
 
 
+/* Wayland does not expose a global list of display modes. */
+static int wl_get_num_display_modes(void)
+{
+    return 0;
+}
+
+
+static ALLEGRO_DISPLAY_MODE *wl_get_display_mode(int index,
+    ALLEGRO_DISPLAY_MODE *mode)
+{
+    (void)index;
+    (void)mode;
+    return NULL;
+}
+
+
 static ALLEGRO_KEYBOARD_DRIVER *wl_get_keyboard_driver(void)
 {
     return _al_wl_keyboard_driver();
@@ -362,9 +445,13 @@ ALLEGRO_SYSTEM_INTERFACE *_al_system_wayland_driver(void)
     wl_vt->get_display_driver = wl_get_display_driver;
     wl_vt->get_num_video_adapters = wl_get_num_video_adapters;
     wl_vt->get_monitor_info = wl_get_monitor_info;
+    wl_vt->get_num_display_modes = wl_get_num_display_modes;
+    wl_vt->get_display_mode = wl_get_display_mode;
     wl_vt->get_keyboard_driver = wl_get_keyboard_driver;
     wl_vt->get_mouse_driver = wl_get_mouse_driver;
     wl_vt->shutdown_system = wl_shutdown_system;
+    wl_vt->create_mouse_cursor = _al_wl_create_mouse_cursor;
+    wl_vt->destroy_mouse_cursor = _al_wl_destroy_mouse_cursor;
     wl_vt->get_path = _al_unix_get_path;
     wl_vt->get_time = _al_unix_get_time;
     wl_vt->rest = _al_unix_rest;

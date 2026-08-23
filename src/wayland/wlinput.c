@@ -1,5 +1,8 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -55,6 +58,10 @@ typedef struct ALLEGRO_MOUSE_WAYLAND {
 
     struct wl_pointer *wl_pointer;
     struct wp_cursor_shape_device_v1 *cursor_shape;
+    ALLEGRO_SYSTEM_MOUSE_CURSOR cursor_id;
+    uint32_t cursor_serial;
+    ALLEGRO_MOUSE_CURSOR_WAYLAND *custom_cursor;
+    bool cursor_hidden;
     bool installed;
 
     ALLEGRO_DISPLAY *display;    /* display the pointer is over */
@@ -382,6 +389,114 @@ void _al_wl_keyboard_repeat_tick(void)
 /*-------------------------------------------------------------------------*/
 /* Pointer/mouse */
 
+static bool wl_cursor_shape_for_id(ALLEGRO_SYSTEM_MOUSE_CURSOR cursor_id,
+    uint32_t *shape)
+{
+    switch (cursor_id) {
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_DEFAULT:
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_ARROW:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_BUSY:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_QUESTION:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_HELP;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_EDIT:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_MOVE:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_N:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_W:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_S:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_E:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_NW:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_SW:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_SE:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_RESIZE_NE:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_PROGRESS:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_PRECISION:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_LINK:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_ALT_SELECT:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_UNAVAILABLE:
+        *shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED;
+        break;
+    case ALLEGRO_SYSTEM_MOUSE_CURSOR_NONE:
+    default:
+        return false;
+    }
+    return true;
+}
+
+static void wl_mouse_apply_cursor_shape(ALLEGRO_MOUSE_WAYLAND *mouse,
+    uint32_t serial)
+{
+    uint32_t shape;
+
+    if (mouse->cursor_shape
+        && wl_cursor_shape_for_id(mouse->cursor_id, &shape)) {
+        wp_cursor_shape_device_v1_set_shape(mouse->cursor_shape, serial,
+            shape);
+    }
+}
+
+static bool wl_mouse_apply_cursor(ALLEGRO_MOUSE_WAYLAND *mouse,
+    uint32_t serial)
+{
+    if (!mouse->wl_pointer)
+        return false;
+
+    if (mouse->cursor_hidden) {
+        if (serial)
+            wl_pointer_set_cursor(mouse->wl_pointer, serial, NULL, 0, 0);
+        return true;
+    }
+
+    if (mouse->custom_cursor) {
+        if (serial)
+            wl_pointer_set_cursor(mouse->wl_pointer, serial,
+                mouse->custom_cursor->surface,
+                mouse->custom_cursor->x_focus, mouse->custom_cursor->y_focus);
+        return true;
+    }
+    if (mouse->cursor_shape) {
+        if (serial)
+            wl_mouse_apply_cursor_shape(mouse, serial);
+        return true;
+    }
+
+    /* Without either a custom cursor or wp_cursor_shape, there is no
+     * portable cursor image to restore after a hide request. */
+    return false;
+}
+
 static void wl_pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
 {
@@ -394,13 +509,14 @@ static void wl_pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     if (!display)
         return;
 
-    /* Reset the cursor to the default arrow.  Without this, a shape set by
-     * the decoration frame (eg. a resize arrow on the window edge) would
-     * remain stuck once the pointer moves over our content surface. */
-    if (mouse->cursor_shape) {
-        wp_cursor_shape_device_v1_set_shape(mouse->cursor_shape, serial,
-            WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
-    }
+    /* The enter serial is required by wp_cursor_shape_device_v1.  Reapply
+     * the application's requested shape because the pointer may have just
+     * crossed from a libdecor decoration surface, which can use its own
+     * resize cursor. */
+    mouse->cursor_serial = serial;
+    if (mouse->cursor_id == ALLEGRO_SYSTEM_MOUSE_CURSOR_NONE)
+        mouse->cursor_id = ALLEGRO_SYSTEM_MOUSE_CURSOR_DEFAULT;
+    wl_mouse_apply_cursor(mouse, serial);
 
     mouse->display = display;
     mouse->state.display = display;
@@ -693,6 +809,288 @@ static const struct wl_pointer_listener pointer_listener = {
 };
 
 
+/* Set and remember a system cursor.  Wayland only changes a shape while
+ * the pointer is focused on one of the client's surfaces, so remember the
+ * request and apply it again from the next pointer-enter handler. */
+bool _al_wl_set_system_mouse_cursor(ALLEGRO_DISPLAY *display,
+    ALLEGRO_SYSTEM_MOUSE_CURSOR cursor_id)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    uint32_t shape;
+    bool supported;
+
+    if (!wl_cursor_shape_for_id(cursor_id, &shape))
+        return false;
+    (void)shape;
+
+    _al_mutex_lock(&s->lock);
+    supported = s->cursor_shape_manager != NULL;
+    if (supported) {
+        the_mouse.cursor_id = cursor_id;
+        the_mouse.custom_cursor = NULL;
+        if (the_mouse.display == display)
+            wl_mouse_apply_cursor(&the_mouse, the_mouse.cursor_serial);
+    }
+    _al_mutex_unlock(&s->lock);
+
+    return supported;
+}
+
+
+/* Create an anonymous file suitable for wl_shm.  The Wayland compositor
+ * opens this fd itself, so the file needs to be backed by shared memory. */
+static int wl_create_shm_file(size_t size)
+{
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    char *path;
+    size_t path_size;
+    int fd;
+
+    if (!runtime_dir || !runtime_dir[0])
+        runtime_dir = "/tmp";
+
+    path_size = strlen(runtime_dir) + strlen("/allegro-cursor-XXXXXX") + 1;
+    path = al_malloc(path_size);
+    if (!path)
+        return -1;
+
+    snprintf(path, path_size, "%s/allegro-cursor-XXXXXX", runtime_dir);
+    fd = mkstemp(path);
+    unlink(path);
+    al_free(path);
+    if (fd < 0)
+        return -1;
+
+    if (ftruncate(fd, (off_t)size) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+
+ALLEGRO_MOUSE_CURSOR *_al_wl_create_mouse_cursor(ALLEGRO_BITMAP *bmp,
+    int x_focus, int y_focus)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    ALLEGRO_MOUSE_CURSOR_WAYLAND *cursor;
+    ALLEGRO_LOCKED_REGION *region = NULL;
+    bool locked_here = false;
+    int width, height, stride;
+    size_t shm_size;
+    int fd = -1;
+    void *shm_data = MAP_FAILED;
+    struct wl_shm_pool *pool = NULL;
+    struct wl_surface *surface = NULL;
+    struct wl_buffer *buffer = NULL;
+    int x, y;
+
+    if (!s->shm || !s->compositor)
+        return NULL;
+
+    width = al_get_bitmap_width(bmp);
+    height = al_get_bitmap_height(bmp);
+    if (width <= 0 || height <= 0 || width > INT_MAX / 4
+        || x_focus < 0 || x_focus >= width
+        || y_focus < 0 || y_focus >= height)
+        return NULL;
+
+    stride = width * 4;
+    shm_size = (size_t)stride * (size_t)height;
+    /* wl_shm_create_pool takes an int32_t size. */
+    if (shm_size > INT32_MAX)
+        return NULL;
+
+    fd = wl_create_shm_file(shm_size);
+    if (fd < 0)
+        return NULL;
+
+    shm_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (shm_data == MAP_FAILED)
+        goto fail;
+
+    if (!al_is_bitmap_locked(bmp)) {
+        region = al_lock_bitmap(bmp, ALLEGRO_PIXEL_FORMAT_ANY,
+            ALLEGRO_LOCK_READONLY);
+        if (!region)
+            goto fail;
+        locked_here = true;
+    }
+
+    /* WL_SHM_FORMAT_ARGB8888 is 0xAARRGGBB; on the little-endian targets
+     * supported by this backend, this writes B,G,R,A bytes as required by
+     * Wayland. */
+    for (y = 0; y < height; y++) {
+        uint32_t *row = (uint32_t *)shm_data + y * width;
+        for (x = 0; x < width; x++) {
+            ALLEGRO_COLOR color = al_get_pixel(bmp, x, y);
+            unsigned char r, g, b, a;
+            al_unmap_rgba(color, &r, &g, &b, &a);
+            row[x] = ((uint32_t)a << 24) | ((uint32_t)r << 16)
+                | ((uint32_t)g << 8) | b;
+        }
+    }
+
+    if (locked_here) {
+        al_unlock_bitmap(bmp);
+        locked_here = false;
+    }
+
+    _al_mutex_lock(&s->lock);
+    pool = wl_shm_create_pool(s->shm, fd, (int)shm_size);
+    if (pool)
+        buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride,
+            WL_SHM_FORMAT_ARGB8888);
+    if (pool)
+        wl_shm_pool_destroy(pool);
+    pool = NULL;
+    close(fd);
+    fd = -1;
+
+    if (buffer)
+        surface = wl_compositor_create_surface(s->compositor);
+    if (surface) {
+        wl_surface_attach(surface, buffer, 0, 0);
+        wl_surface_damage(surface, 0, 0, width, height);
+        wl_surface_commit(surface);
+    }
+    _al_mutex_unlock(&s->lock);
+
+    if (!buffer || !surface)
+        goto fail;
+
+    cursor = al_calloc(1, sizeof *cursor);
+    if (!cursor) {
+        _al_mutex_lock(&s->lock);
+        wl_surface_destroy(surface);
+        wl_buffer_destroy(buffer);
+        _al_mutex_unlock(&s->lock);
+        munmap(shm_data, shm_size);
+        return NULL;
+    }
+
+    cursor->surface = surface;
+    cursor->buffer = buffer;
+    cursor->shm_data = shm_data;
+    cursor->shm_size = shm_size;
+    cursor->x_focus = x_focus;
+    cursor->y_focus = y_focus;
+    return (ALLEGRO_MOUSE_CURSOR *)cursor;
+
+fail:
+    if (locked_here)
+        al_unlock_bitmap(bmp);
+    if (pool)
+        wl_shm_pool_destroy(pool);
+    if (fd >= 0)
+        close(fd);
+    if (surface || buffer) {
+        _al_mutex_lock(&s->lock);
+        if (surface)
+            wl_surface_destroy(surface);
+        if (buffer)
+            wl_buffer_destroy(buffer);
+        _al_mutex_unlock(&s->lock);
+    }
+    if (shm_data != MAP_FAILED)
+        munmap(shm_data, shm_size);
+    return NULL;
+}
+
+
+void _al_wl_destroy_mouse_cursor(ALLEGRO_MOUSE_CURSOR *cursor)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    ALLEGRO_MOUSE_CURSOR_WAYLAND *wl_cursor =
+        (ALLEGRO_MOUSE_CURSOR_WAYLAND *)cursor;
+
+    _al_mutex_lock(&s->lock);
+    if (the_mouse.custom_cursor == wl_cursor) {
+        the_mouse.custom_cursor = NULL;
+        if (the_mouse.display)
+            wl_mouse_apply_cursor(&the_mouse, the_mouse.cursor_serial);
+    }
+    if (wl_cursor->surface)
+        wl_surface_destroy(wl_cursor->surface);
+    if (wl_cursor->buffer)
+        wl_buffer_destroy(wl_cursor->buffer);
+    _al_mutex_unlock(&s->lock);
+
+    if (wl_cursor->shm_data)
+        munmap(wl_cursor->shm_data, wl_cursor->shm_size);
+    al_free(wl_cursor);
+}
+
+
+bool _al_wl_set_mouse_cursor(ALLEGRO_DISPLAY *display,
+    ALLEGRO_MOUSE_CURSOR *cursor)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    ALLEGRO_MOUSE_CURSOR_WAYLAND *wl_cursor =
+        (ALLEGRO_MOUSE_CURSOR_WAYLAND *)cursor;
+
+    if (!wl_cursor || !wl_cursor->surface)
+        return false;
+
+    _al_mutex_lock(&s->lock);
+    the_mouse.custom_cursor = wl_cursor;
+    if (the_mouse.display == display)
+        wl_mouse_apply_cursor(&the_mouse, the_mouse.cursor_serial);
+    _al_mutex_unlock(&s->lock);
+
+    return true;
+}
+
+
+bool _al_wl_hide_mouse_cursor(ALLEGRO_DISPLAY *display)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    bool supported;
+
+    _al_mutex_lock(&s->lock);
+    supported = the_mouse.wl_pointer != NULL;
+    if (supported) {
+        /* wl_pointer.set_cursor(NULL) is the protocol-defined hidden
+         * cursor.  If the pointer is not focused yet, the flag is applied
+         * by the next pointer-enter handler with its fresh serial. */
+        the_mouse.cursor_hidden = true;
+        if (the_mouse.display == display)
+            wl_mouse_apply_cursor(&the_mouse, the_mouse.cursor_serial);
+    }
+    _al_mutex_unlock(&s->lock);
+
+    return supported;
+}
+
+
+bool _al_wl_show_mouse_cursor(ALLEGRO_DISPLAY *display)
+{
+    ALLEGRO_SYSTEM_WAYLAND *s =
+        (ALLEGRO_SYSTEM_WAYLAND *)al_get_system_driver();
+    bool supported;
+
+    _al_mutex_lock(&s->lock);
+    supported = the_mouse.wl_pointer != NULL
+        && (the_mouse.custom_cursor != NULL
+            || the_mouse.cursor_shape != NULL);
+    if (supported) {
+        the_mouse.cursor_hidden = false;
+        if (the_mouse.display == display)
+            supported = wl_mouse_apply_cursor(&the_mouse,
+                the_mouse.cursor_serial);
+    }
+    _al_mutex_unlock(&s->lock);
+
+    return supported;
+}
+
+
 /*-------------------------------------------------------------------------*/
 /* Seat */
 
@@ -867,6 +1265,8 @@ static bool wl_mouse_init(void)
 
     _al_event_source_init(&the_mouse.parent.es);
     memset(&the_mouse.state, 0, sizeof the_mouse.state);
+    the_mouse.cursor_id = ALLEGRO_SYSTEM_MOUSE_CURSOR_DEFAULT;
+    the_mouse.cursor_serial = 0;
     the_mouse.installed = true;
     return true;
 }
