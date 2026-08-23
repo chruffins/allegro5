@@ -303,6 +303,28 @@ bool _al_wlegl_config_create_context(ALLEGRO_DISPLAY_WAYLAND *d)
       return false;
    }
 
+   /* set vsync here */
+   int requested_vsync = al_get_new_display_option(ALLEGRO_VSYNC, NULL);
+   int effective_vsync = 2;
+   if (requested_vsync == 1 || requested_vsync == 2) {
+      int interval = requested_vsync == 1 ? 1 : 0;
+      ALLEGRO_DEBUG("requested vsync=%d (EGL swap interval %d).\n",
+         requested_vsync, interval);
+      if (eglSwapInterval(system->egl_display, interval) == EGL_FALSE) {
+         ALLEGRO_WARN("eglSwapInterval(%d) failed: %#x\n",
+            interval, eglGetError());
+         /* The driver did not accept the requested setting... */
+         effective_vsync = 0;
+      }
+      else {
+         effective_vsync = requested_vsync;
+      }
+   }
+   else {
+      ALLEGRO_DEBUG("vsync not forced; using compositor default.\n");
+   }
+   display->extra_settings.settings[ALLEGRO_VSYNC] = effective_vsync;
+
    display->ogl_extras->is_shared = (existing_ctx != EGL_NO_CONTEXT);
 
    ALLEGRO_DEBUG("Got EGL context.\n");
