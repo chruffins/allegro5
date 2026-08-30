@@ -432,15 +432,17 @@ acodec_summary(" - Opus" SUPPORT_OPUS)
 # MP3
 #
 if(WANT_MP3)
-    find_package(MiniMP3)
-    if(MINIMP3_FOUND)
+    # minimp3 is distributed as a pair of public-domain headers vendored here.
+    set(MINIMP3_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/minimp3)
+    if(EXISTS ${MINIMP3_INCLUDE_DIRS}/minimp3.h
+       AND EXISTS ${MINIMP3_INCLUDE_DIRS}/minimp3_ex.h)
         include_directories(SYSTEM ${MINIMP3_INCLUDE_DIRS})
+        set(MINIMP3_FOUND 1)
         set(ALLEGRO_CFG_ACODEC_MP3 1)
         list(APPEND ACODEC_SOURCES mp3.c)
-    endif(MINIMP3_FOUND)
-    if(NOT MINIMP3_FOUND)
-        message("WARNING: minimp3 was not found")
-    endif(NOT MINIMP3_FOUND)
+    else()
+        message("WARNING: bundled minimp3 was not found")
+    endif()
 endif()
 
 acodec_summary(" - MP3" MINIMP3_FOUND)
