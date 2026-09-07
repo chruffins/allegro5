@@ -33,6 +33,7 @@ typedef struct MP3FILE
 
    int freq;
    int channels;
+   bool error_reported;
    ALLEGRO_CHANNEL_CONF chan_conf;
 } MP3FILE;
 
@@ -142,7 +143,10 @@ static bool mp3_stream_seek(ALLEGRO_AUDIO_STREAM *stream, double time)
    }
 
    position = (uint64_t)(time * mp3file->freq * mp3file->channels);
-   return mp3dec_ex_seek(&mp3file->dec, position) == 0;
+   if (mp3dec_ex_seek(&mp3file->dec, position) != 0)
+      return false;
+   mp3file->error_reported = false;
+   return true;
 }
 
 static bool mp3_stream_rewind(ALLEGRO_AUDIO_STREAM *stream)
@@ -218,8 +222,11 @@ static size_t mp3_stream_update(ALLEGRO_AUDIO_STREAM *stream, void *data,
       samples_to_read = mp3dec_ex_read(&mp3file->dec,
          (mp3d_sample_t *)data + samples_read, samples_to_read);
       if (mp3file->dec.last_error) {
-         ALLEGRO_WARN("MP3 stream decode failed: %d.\n",
-            mp3file->dec.last_error);
+         if (!mp3file->error_reported) {
+            ALLEGRO_WARN("MP3 stream decode failed: %d.\n",
+               mp3file->dec.last_error);
+            mp3file->error_reported = true;
+         }
          break;
       }
       samples_read += samples_to_read;
