@@ -184,43 +184,51 @@ static size_t mp3_stream_update(ALLEGRO_AUDIO_STREAM *stream, void *data,
    size_t buf_size)
 {
    MP3FILE *mp3file = (MP3FILE *)stream->extra;
+   bool looping = stream->spl.loop != _ALLEGRO_PLAYMODE_STREAM_ONCE;
    size_t samples_needed = buf_size / sizeof(mp3d_sample_t);
-   size_t samples_read;
-   double ctime = mp3_stream_get_position(stream);
-   double btime = (double)samples_needed
-      / mp3file->channels / mp3file->freq;
+   size_t samples_read = 0;
 
-   if (stream->spl.loop != _ALLEGRO_PLAYMODE_STREAM_ONCE) {
-      if (ctime >= mp3file->loop_end) {
-         if (!mp3_stream_rewind(stream))
-            return 0;
-         ctime = mp3_stream_get_position(stream);
-      }
-      if (ctime + btime > mp3file->loop_end) {
-         double remaining = mp3file->loop_end - ctime;
-         if (remaining <= 0)
-            return 0;
-         samples_needed = (size_t)(remaining * mp3file->freq
-            * mp3file->channels);
-      }
-   }
+   /* A fragment can cross the loop endpoint more than once, like when
+    * it is larger than the entire stream. */
+   while (samples_read < samples_needed) {
+      size_t samples_to_read = samples_needed - samples_read;
+      size_t requested = samples_to_read;
+      double ctime = mp3_stream_get_position(stream);
 
-   samples_read = mp3dec_ex_read(&mp3file->dec, data, samples_needed);
-   if (mp3file->dec.last_error) {
-      ALLEGRO_WARN("MP3 stream decode failed: %d.\n",
-         mp3file->dec.last_error);
-      return samples_read * sizeof(mp3d_sample_t);
-   }
-   if (samples_read < samples_needed
-       && stream->spl.loop != _ALLEGRO_PLAYMODE_STREAM_ONCE) {
-      if (!mp3_stream_rewind(stream))
-         return samples_read * sizeof(mp3d_sample_t);
-      samples_read += mp3dec_ex_read(&mp3file->dec,
-         (mp3d_sample_t *)data + samples_read,
-         samples_needed - samples_read);
-      if (mp3file->dec.last_error)
+      if (looping) {
+         if (ctime >= mp3file->loop_end) {
+            if (!mp3_stream_rewind(stream))
+               break;
+            ctime = mp3_stream_get_position(stream);
+         }
+         if (ctime + (double)samples_to_read / mp3file->channels
+               / mp3file->freq > mp3file->loop_end) {
+            double remaining = mp3file->loop_end - ctime;
+            /* The next iteration will rewind at the loop endpoint. */
+            samples_to_read = (size_t)(remaining * mp3file->freq
+               * mp3file->channels);
+            if (samples_to_read == 0) {
+               if (!mp3_stream_rewind(stream))
+                  break;
+               continue;
+            }
+         }
+      }
+
+      samples_to_read = mp3dec_ex_read(&mp3file->dec,
+         (mp3d_sample_t *)data + samples_read, samples_to_read);
+      if (mp3file->dec.last_error) {
          ALLEGRO_WARN("MP3 stream decode failed: %d.\n",
             mp3file->dec.last_error);
+         break;
+      }
+      samples_read += samples_to_read;
+
+      /* A short read or loop-limited read leaves data to fill. */
+      if (samples_to_read < requested) {
+         if (!looping || !mp3_stream_rewind(stream))
+            break;
+      }
    }
 
    return samples_read * sizeof(mp3d_sample_t);
